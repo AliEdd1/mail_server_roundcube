@@ -42,6 +42,6 @@ It’s based on real, working manual steps, rewritten to be repeatable.
 ## 3. Usage
 
 ```bash
-git clone https://github.com/your-user/your-mail-repo.git
-cd your-mail-repo
-sudo bash install-mailstack.sh
+git clone https://github.com/AliEdd1/mail_server_roundcube.git
+cd mail_server_roundcube.git
+sudo bash mail.sh
