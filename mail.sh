@@ -13,15 +13,28 @@ DKIM_KEY_PATH="/var/lib/rspamd/dkim/${DOMAIN}.${DKIM_SELECTOR}.key"
 PHP_FPM_SOCK="/run/php/php-fpm.sock"
 #############################################
 
+log() {
+  echo "==> $*"
+}
+
+section() {
+  echo
+  echo "============================================================"
+  echo " $*"
+  echo "============================================================"
+}
+
 if [[ $EUID -ne 0 ]]; then
   echo "Run as root."
   exit 1
 fi
 
-echo "[1/20] set hostname"
+section "1) Hostname and base packages"
+
+log "Setting hostname to ${MAIL_HOST}"
 hostnamectl set-hostname "${MAIL_HOST}"
 
-echo "[2/20] apt update & install packages"
+log "Updating apt and installing mail/web packages..."
 apt update
 DEBIAN_FRONTEND=noninteractive apt install -y \
   postfix postfix-pcre dovecot-imapd dovecot-lmtpd dovecot-core \
@@ -29,26 +42,37 @@ DEBIAN_FRONTEND=noninteractive apt install -y \
   php-mysql php-gd php-curl php-zip php-ldap php-imap roundcube roundcube-core \
   roundcube-plugins roundcube-mysql certbot python3-certbot-nginx
 
-echo "[3/20] create vmail user"
+section "2) vmail user and maildir base"
+
+log "Ensuring vmail group (gid 5000) exists..."
 if ! getent group vmail >/dev/null; then
   groupadd -g 5000 vmail
 fi
+
+log "Ensuring vmail user (uid 5000) exists..."
 if ! id vmail >/dev/null 2>&1; then
   useradd -g vmail -u 5000 vmail -d /var/mail/vmail -m
 fi
+
+log "Creating /var/mail/vmail and fixing permissions..."
 mkdir -p /var/mail/vmail
 chown -R vmail:vmail /var/mail/vmail
 chmod 750 /var/mail/vmail
 
-echo "[4/20] configure MariaDB for roundcube"
+section "3) MariaDB for Roundcube"
+
+log "Creating Roundcube database and user..."
 mysql -u root <<SQL
 CREATE DATABASE IF NOT EXISTS roundcube CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS 'roundcube'@'localhost' IDENTIFIED BY '${ROUNDCUBE_DB_PASS}';
 GRANT ALL PRIVILEGES ON roundcube.* TO 'roundcube'@'localhost';
 FLUSH PRIVILEGES;
 SQL
+log "MariaDB for Roundcube configured."
 
-echo "[5/20] write roundcube config"
+section "4) Roundcube config"
+
+log "Writing /etc/roundcube/config.inc.php ..."
 cat > /etc/roundcube/config.inc.php <<EOF
 <?php
 \$config['db_dsnw'] = 'mysql://roundcube:${ROUNDCUBE_DB_PASS}@localhost/roundcube';
@@ -61,8 +85,11 @@ cat > /etc/roundcube/config.inc.php <<EOF
 \$config['smtp_user']   = '%u';
 \$config['smtp_pass']   = '%p';
 EOF
+log "Roundcube configured to talk to IMAP ${MAIL_HOST}:993 and SMTP ${MAIL_HOST}:587."
 
-echo "[6/20] dovecot main config"
+section "5) Configuring Dovecot (IMAP + LMTP + virtual users)"
+
+log "Writing /etc/dovecot/dovecot.conf ..."
 cat > /etc/dovecot/dovecot.conf <<'EOF'
 protocols = imap lmtp
 listen = *
@@ -71,22 +98,23 @@ auth_mechanisms = plain login
 !include_try local.conf
 EOF
 
-echo "[7/20] dovecot mail location"
+log "Writing /etc/dovecot/conf.d/10-mail.conf ..."
 cat > /etc/dovecot/conf.d/10-mail.conf <<'EOF'
 mail_location = maildir:/var/mail/vmail/%d/%n
 mail_uid = vmail
 mail_gid = vmail
 EOF
 
-echo "[8/20] dovecot passwd file (sample users)"
+log "Creating sample virtual users in /etc/dovecot/passwd ..."
 cat > /etc/dovecot/passwd <<EOF
 admin@${DOMAIN}:{PLAIN}${DOVECOT_USER_PASS_PLAIN}
 info@${DOMAIN}:{PLAIN}${DOVECOT_USER_PASS_PLAIN}
 EOF
 chown root:dovecot /etc/dovecot/passwd
 chmod 640 /etc/dovecot/passwd
+log "Dovecot password file ready."
 
-echo "[9/20] dovecot auth (passwd-file)"
+log "Writing /etc/dovecot/conf.d/auth-passwdfile.conf.ext ..."
 cat > /etc/dovecot/conf.d/auth-passwdfile.conf.ext <<'EOF'
 passdb {
   driver = passwd-file
@@ -99,13 +127,13 @@ userdb {
 }
 EOF
 
-echo "[10/20] dovecot 10-auth (disable system, enable passwd-file)"
+log "Enabling passwd-file auth in /etc/dovecot/conf.d/10-auth.conf ..."
 sed -i 's/^!include auth-system.conf.ext/#!include auth-system.conf.ext/' /etc/dovecot/conf.d/10-auth.conf
 if ! grep -q 'auth-passwdfile.conf.ext' /etc/dovecot/conf.d/10-auth.conf; then
   echo '!include auth-passwdfile.conf.ext' >> /etc/dovecot/conf.d/10-auth.conf
 fi
 
-echo "[11/20] dovecot master for postfix lmtp & auth"
+log "Writing /etc/dovecot/conf.d/10-master.conf for LMTP + Postfix auth ..."
 cat > /etc/dovecot/conf.d/10-master.conf <<'EOF'
 service lmtp {
   unix_listener /var/spool/postfix/private/dovecot-lmtp {
@@ -125,14 +153,20 @@ service auth {
 }
 EOF
 
-echo "[12/20] dovecot ssl (Let’s Encrypt paths)"
+log "Writing /etc/dovecot/conf.d/10-ssl.conf (expects LE certs)..."
 cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
 ssl = required
 ssl_cert = </etc/letsencrypt/live/${MAIL_HOST}/fullchain.pem
 ssl_key  = </etc/letsencrypt/live/${MAIL_HOST}/privkey.pem
 EOF
 
-echo "[13/20] postfix main.cf"
+log "Restarting Dovecot..."
+systemctl restart dovecot
+log "Dovecot is configured."
+
+section "6) Configuring Postfix (virtual, LMTP to Dovecot, submission, Rspamd)"
+
+log "Writing /etc/postfix/main.cf ..."
 cat > /etc/postfix/main.cf <<EOF
 myhostname = ${MAIL_HOST}
 mydomain = ${DOMAIN}
@@ -170,7 +204,7 @@ smtpd_milters = inet:127.0.0.1:11332
 non_smtpd_milters = inet:127.0.0.1:11332
 EOF
 
-echo "[14/20] postfix master.cf (add submission if missing)"
+log "Ensuring submission service in /etc/postfix/master.cf ..."
 if ! grep -q "^submission " /etc/postfix/master.cf; then
 cat >> /etc/postfix/master.cf <<'EOF'
 
@@ -183,20 +217,31 @@ submission inet n       -       y       -       -       smtpd
 EOF
 fi
 
-echo "[15/20] postfix virtual mailbox file"
+log "Writing /etc/postfix/vmailbox (sample boxes)..."
 cat > /etc/postfix/vmailbox <<EOF
 admin@${DOMAIN}   ${DOMAIN}/admin/
 info@${DOMAIN}    ${DOMAIN}/info/
 EOF
+
+log "Running postmap on /etc/postfix/vmailbox ..."
 postmap /etc/postfix/vmailbox
 
-echo "[16/20] create maildirs"
+log "Restarting Postfix..."
+systemctl restart postfix
+log "Postfix is configured."
+
+section "7) Creating maildirs for sample users"
+
+log "Creating /var/mail/vmail/${DOMAIN}/admin and /var/mail/vmail/${DOMAIN}/info ..."
 mkdir -p /var/mail/vmail/${DOMAIN}/admin
 mkdir -p /var/mail/vmail/${DOMAIN}/info
 chown -R vmail:vmail /var/mail/vmail/${DOMAIN}
 chmod -R 700 /var/mail/vmail/${DOMAIN}
+log "Maildirs created."
 
-echo "[17/20] nginx for roundcube"
+section "8) Nginx vhost for Roundcube"
+
+log "Writing /etc/nginx/sites-available/${MAIL_HOST} ..."
 cat > /etc/nginx/sites-available/${MAIL_HOST} <<EOF
 server {
     listen 443 ssl http2;
@@ -230,18 +275,31 @@ server {
 }
 EOF
 
+log "Enabling nginx site..."
 ln -sf /etc/nginx/sites-available/${MAIL_HOST} /etc/nginx/sites-enabled/${MAIL_HOST}
-nginx -t
-systemctl reload nginx
 
-echo "[18/20] rspamd DKIM (placeholder)"
+log "Testing nginx config..."
+nginx -t
+
+log "Reloading nginx..."
+systemctl reload nginx
+log "Nginx vhost for Roundcube is ready."
+
+section "9) Rspamd / DKIM"
+
+log "Creating /var/lib/rspamd/dkim ..."
 mkdir -p /var/lib/rspamd/dkim
+
 if [[ ! -f "${DKIM_KEY_PATH}" ]]; then
+  log "Creating placeholder DKIM key file at ${DKIM_KEY_PATH} (paste your key here)..."
   echo "# paste your DKIM private key here" > "${DKIM_KEY_PATH}"
   chown _rspamd:_rspamd "${DKIM_KEY_PATH}"
   chmod 600 "${DKIM_KEY_PATH}"
+else
+  log "DKIM key file already exists at ${DKIM_KEY_PATH}"
 fi
 
+log "Writing /etc/rspamd/local.d/dkim_signing.conf ..."
 cat > /etc/rspamd/local.d/dkim_signing.conf <<EOF
 domain {
     ${DOMAIN} {
@@ -257,19 +315,36 @@ use_domain = "header";
 use_esld = false;
 EOF
 
+log "Restarting rspamd..."
 systemctl restart rspamd
+log "Rspamd/DKIM configured."
 
-echo "[19/20] restart services"
+section "10) Final restarts and notes"
+
+log "Restarting main services just to be safe..."
 systemctl restart dovecot
 systemctl restart postfix
 systemctl restart php*-fpm || true
 systemctl restart nginx
 
-echo "[20/20] done."
-
+echo
+echo "============================================================"
+echo " DONE"
+echo "============================================================"
+echo "Domain:            ${DOMAIN}"
+echo "Mail host:         ${MAIL_HOST}"
+echo "Roundcube URL:     https://${MAIL_HOST}"
+echo "IMAP:              ${MAIL_HOST}:993 (SSL)"
+echo "SMTP submission:   ${MAIL_HOST}:587 (STARTTLS)"
+echo
+echo "Users created:"
+echo "  admin@${DOMAIN}"
+echo "  info@${DOMAIN}"
+echo "Password (both):   ${DOVECOT_USER_PASS_PLAIN}"
 echo
 echo "IMPORTANT:"
-echo "1) Get cert:  certbot certonly --manual --preferred-challenges dns -d ${MAIL_HOST}"
-echo "2) Paste real DKIM key into: ${DKIM_KEY_PATH}"
-echo "3) Login to: https://${MAIL_HOST} with admin@${DOMAIN}"
+echo "1) You MUST have LE certs at: /etc/letsencrypt/live/${MAIL_HOST}/"
+echo "   If not, run: certbot certonly --manual --preferred-challenges dns -d ${MAIL_HOST}"
+echo "2) Paste your REAL DKIM private key into: ${DKIM_KEY_PATH}"
+echo "3) Then: systemctl restart rspamd postfix dovecot nginx"
 echo
