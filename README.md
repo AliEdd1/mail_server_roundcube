@@ -32,8 +32,8 @@ It’s based on real, working manual steps, rewritten to be repeatable.
 ## 2. Requirements
 
 - Fresh Debian/Ubuntu server
-- A real domain, e.g. `manatsp.ir`
-- DNS A record: `mail.manatsp.ir -> your_server_ip`
+- A real domain, e.g. `example.com`
+- DNS A record: `mail.example.com -> your_server_ip`
 - Let’s Encrypt certificate present (or you run `certbot` yourself)
 - Port 80/443/25/587/993 open
 
